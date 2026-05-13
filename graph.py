@@ -10,11 +10,9 @@ from langgraph.graph import END, StateGraph
 from hotel_booking_agent.hotel_service import search_hotels, format_hotels_response
 
 from .hotel_budget import filter_hotel_response_by_budget
-from .itinerary import generate_weather_aware_itinerary
 from .providers import search_flights, search_trains
 from .schemas import Budget, HotelOption, Itinerary, TravelOption, TravelState
 from .train_price import enrich_train_prices
-from .weather import get_current_weather_for_state
 
 
 ORCHESTRATOR_PROMPT = (
@@ -385,18 +383,17 @@ def budget_node(raw_state: Dict[str, Any]) -> Dict[str, Any]:
 def travel_search_node(raw_state: Dict[str, Any]) -> Dict[str, Any]:
     state = _state_from_dict(raw_state)
 
-    async def run_parallel() -> tuple[List[TravelOption], List[str], Dict[str, int], Dict[str, Any]]:
-        flight_result, train_result, weather_result = await asyncio.gather(
+    async def run_parallel() -> tuple[List[TravelOption], List[str], Dict[str, int]]:
+        results = await asyncio.gather(
             search_flights(state),
             search_trains(state),
-            asyncio.to_thread(get_current_weather_for_state, state),
             return_exceptions=True,
         )
         options: List[TravelOption] = []
         errors: List[str] = []
         counts: Dict[str, int] = {}
-        weather: Dict[str, Any] = {}
-        for label, result in (("flight", flight_result), ("train", train_result)):
+        labels = ["flight", "train"]
+        for label, result in zip(labels, results):
             if isinstance(result, Exception):
                 counts[label] = 0
                 message = str(result)
@@ -409,30 +406,13 @@ def travel_search_node(raw_state: Dict[str, Any]) -> Dict[str, Any]:
                 if not result:
                     errors.append(f"{label.title()} agent returned 0 option(s).")
                 options.extend(result)
+        return options, errors, counts
 
-        if isinstance(weather_result, Exception):
-            weather = {
-                "error": f"Weather agent failed: {weather_result}",
-                "location": state.trip_details.destination or "Unknown",
-            }
-            errors.append(weather["error"])
-        else:
-            weather = weather_result if isinstance(weather_result, dict) else {
-                "error": "Weather agent returned an invalid response",
-                "location": state.trip_details.destination or "Unknown",
-            }
-            if weather.get("error"):
-                errors.append(f"Weather agent warning: {weather['error']}")
-        return options, errors, counts, weather
-
-    options, errors, counts, weather = asyncio.run(run_parallel())
+    options, errors, counts = asyncio.run(run_parallel())
     state.travel_options = options
-    state.weather = weather
     state.errors.extend(errors)
     state.metadata["agent_option_counts"] = counts
-    state.metadata["parallel_agents_completed"] = ["flight", "train", "weather"]
-    state.metadata["weather_agent_completed"] = bool(weather)
-    state.metadata["weather_agent_status"] = "error" if weather.get("error") else "ok"
+    state.metadata["parallel_agents_completed"] = ["flight", "train"]
     enriched_options, train_price_data, train_price_error = enrich_train_prices(state)
     state.travel_options = enriched_options
     if train_price_data:
@@ -614,38 +594,6 @@ def _format_option(option: TravelOption) -> str:
     )
 
 
-def _fallback_itinerary(state: TravelState, selected: TravelOption) -> Itinerary:
-    hotel_name = state.selected_hotel.name if state.selected_hotel else "a hotel option"
-    return Itinerary(
-        travel=selected,
-        hotel=state.selected_hotel,
-        summary=(
-            f"Travel option selected: {_format_option(selected)}. "
-            f"Hotel step completed with {hotel_name}."
-        ),
-    )
-
-
-def _generate_itinerary_with_orchestrator_retry(state: TravelState, selected: TravelOption) -> Itinerary:
-    last_error: Optional[Exception] = None
-    for attempt in range(1, 3):
-        try:
-            itinerary = generate_weather_aware_itinerary(state)
-            state.metadata["itinerary_generation_attempts"] = attempt
-            state.metadata["itinerary_generation_retry_used"] = attempt == 2
-            state.metadata["itinerary_generation_status"] = "ok"
-            return itinerary
-        except Exception as exc:
-            last_error = exc
-            state.metadata["itinerary_generation_attempts"] = attempt
-
-    state.metadata["itinerary_generation_status"] = "fallback"
-    state.metadata["itinerary_generation_retry_used"] = True
-    message = f"LLM itinerary generation failed after 2 attempts: {last_error}"
-    state.errors.append(message)
-    return _fallback_itinerary(state, selected)
-
-
 def continue_after_travel_selection(
     state_data: Dict[str, Any],
     selected_option_id: str,
@@ -710,8 +658,15 @@ def continue_after_travel_selection(
     else:
         hotels_message = f"I could not find any live hotels for {selected.destination} matching your dates."
 
-    state.itinerary = _fallback_itinerary(state, selected)
-    state.itinerary = _generate_itinerary_with_orchestrator_retry(state, selected)
+    hotel_name = state.selected_hotel.name if state.selected_hotel else "a hotel option"
+    state.itinerary = Itinerary(
+        travel=selected,
+        hotel=state.selected_hotel,
+        summary=(
+            f"Travel option selected: {_format_option(selected)}. "
+            f"Hotel step completed with {hotel_name}."
+        ),
+    )
     
     state.hotel_payload = {"answer": f"Great. I will use that travel option and now check hotels.\n\n{hotels_message}"}
     
